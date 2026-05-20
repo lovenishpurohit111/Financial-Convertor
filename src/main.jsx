@@ -367,16 +367,9 @@ function App() {
     yahooDebounce.current = setTimeout(async () => {
       setYahooSearching(true);
       try {
-        // Call Yahoo Finance search directly from browser
-        const r = await fetch(
-          `https://query2.finance.yahoo.com/v1/finance/search?q=${encodeURIComponent(q)}&lang=en-US&region=IN&quotesCount=8&newsCount=0`,
-          { headers: { "Accept": "application/json" } }
-        );
-        const data = await r.json();
-        const quotes = (data?.quotes || [])
-          .filter(q => ["EQUITY","ETF"].includes(q.quoteType))
-          .map(q => ({ symbol: q.symbol, name: q.shortname || q.longname || q.symbol, exchange: q.exchange }));
-        setYahooResults(quotes);
+        // Search via proxy (Yahoo blocks direct browser requests with CORS)
+        const data = await fetchJson(`/api/yahoo?action=search&q=${encodeURIComponent(q)}`);
+        setYahooResults(data.quotes || []);
       } catch { setYahooResults([]); }
       setYahooSearching(false);
     }, 400);
@@ -388,16 +381,8 @@ function App() {
     setYahooFetching(true);
     setError("");
     try {
-      // Call Yahoo Finance directly from browser (avoids server-side 403)
-      const modules = "incomeStatementHistory,balanceSheetHistory,cashflowStatementHistory";
-      const r = await fetch(
-        `https://query1.finance.yahoo.com/v10/finance/quoteSummary/${encodeURIComponent(symbol)}?modules=${modules}`,
-        { headers: { "Accept": "application/json" } }
-      );
-      if (!r.ok) throw new Error(`Yahoo Finance returned ${r.status}`);
-      const json = await r.json();
-      if (json?.quoteSummary?.error) throw new Error(json.quoteSummary.error.description || "Yahoo Finance error");
-      const data = json?.quoteSummary?.result?.[0] || {};
+      const data = await fetchJson(`/api/yahoo?action=financials&symbol=${encodeURIComponent(symbol)}`);
+      if (data.error) throw new Error(data.error);
       const stmts = parseYahooStatements(data, symbol, name);
       if (!stmts.length) throw new Error("No financial data found for this company on Yahoo Finance.");
       setJob(current => ({
