@@ -9,9 +9,11 @@ import {
   FileSpreadsheet,
   FileText,
   FolderUp,
+  Globe,
   Loader2,
   Plus,
   RotateCcw,
+  Search,
   ShieldCheck,
   Trash2,
   Wand2
@@ -29,6 +31,106 @@ const emptyJob = {
   validation: { issues: [], summary: { high: 0, medium: 0, low: 0 } },
   pipeline: []
 };
+
+// ── Yahoo Finance statement parser ────────────────────────────────────────────
+function parseYahooStatements(data, symbol, companyName) {
+  const stmts = [];
+
+  function fmtDate(epoch) {
+    if (!epoch) return "";
+    const d = new Date(epoch * 1000);
+    return `${d.toLocaleString("default",{month:"short"})} ${d.getFullYear()}`;
+  }
+
+  function makeRows(items, fieldMap) {
+    if (!items?.length) return { columns: [], rows: [] };
+    const columns = items.map(item => fmtDate(item.endDate?.raw)).filter(Boolean);
+    const rows = Object.entries(fieldMap).map(([key, label]) => {
+      const values = items.map(item => {
+        const v = item[key]?.raw;
+        return v != null ? Math.round(v / 1e5) / 10 : null; // convert to Cr (÷10M)
+      });
+      const isTotal = /total|net|gross/i.test(label);
+      return {
+        id: crypto.randomUUID(), label, section: "General", note: null,
+        is_bold: isTotal, row_type: isTotal ? "total" : "line_item",
+        values, amount: values.find(v => v != null) ?? 0,
+        level: 1, confidence: 0.99, issues: []
+      };
+    }).filter(r => r.values.some(v => v !== null));
+    return { columns, rows };
+  }
+
+  // Income Statement
+  const incomeItems = data.incomeStatementHistory?.incomeStatementHistory;
+  if (incomeItems?.length) {
+    const td = makeRows(incomeItems, {
+      totalRevenue: "Total Revenue",
+      costOfRevenue: "Cost of Revenue",
+      grossProfit: "Gross Profit",
+      researchDevelopment: "Research & Development",
+      sellingGeneralAdministrative: "Selling, General & Administrative",
+      totalOperatingExpenses: "Total Operating Expenses",
+      operatingIncome: "Operating Income (EBIT)",
+      totalOtherIncomeExpenseNet: "Other Income/Expense",
+      ebit: "EBIT",
+      interestExpense: "Interest Expense",
+      incomeBeforeTax: "Income Before Tax",
+      incomeTaxExpense: "Income Tax Expense",
+      netIncome: "Net Income",
+      netIncomeApplicableToCommonShares: "Net Income (Common)",
+    });
+    if (td.rows.length) stmts.push({ id: crypto.randomUUID(), statement_type: "Profit & Loss",
+      unit: `${companyName} (${symbol}) — Figures in ₹ Cr`, rows: td.rows, tableData: td });
+  }
+
+  // Balance Sheet
+  const bsItems = data.balanceSheetHistory?.balanceSheetStatements;
+  if (bsItems?.length) {
+    const td = makeRows(bsItems, {
+      totalAssets: "Total Assets",
+      totalCurrentAssets: "Total Current Assets",
+      cash: "Cash & Equivalents",
+      shortTermInvestments: "Short-term Investments",
+      netReceivables: "Net Receivables",
+      inventory: "Inventory",
+      otherCurrentAssets: "Other Current Assets",
+      totalNonCurrentAssets: "Total Non-Current Assets (calc)",
+      propertyPlantEquipment: "Property, Plant & Equipment",
+      longTermInvestments: "Long-term Investments",
+      otherAssets: "Other Assets",
+      totalLiab: "Total Liabilities",
+      totalCurrentLiabilities: "Total Current Liabilities",
+      shortLongTermDebt: "Short/Current Long-term Debt",
+      accountsPayable: "Accounts Payable",
+      otherCurrentLiabilities: "Other Current Liabilities",
+      longTermDebt: "Long-term Debt",
+      otherLiab: "Other Liabilities",
+      totalStockholderEquity: "Total Stockholder Equity",
+      retainedEarnings: "Retained Earnings",
+      commonStock: "Common Stock",
+    });
+    if (td.rows.length) stmts.push({ id: crypto.randomUUID(), statement_type: "Balance Sheet",
+      unit: `${companyName} (${symbol}) — Figures in ₹ Cr`, rows: td.rows, tableData: td });
+  }
+
+  // Cash Flow
+  const cfItems = data.cashflowStatementHistory?.cashflowStatements;
+  if (cfItems?.length) {
+    const td = makeRows(cfItems, {
+      totalCashFromOperatingActivities: "Cash from Operations",
+      capitalExpenditures: "Capital Expenditures",
+      totalCashFromInvestingActivities: "Cash from Investing",
+      totalCashFromFinancingActivities: "Cash from Financing",
+      changeInCash: "Net Change in Cash",
+      freeCashFlow: "Free Cash Flow",
+    });
+    if (td.rows.length) stmts.push({ id: crypto.randomUUID(), statement_type: "Cash Flow",
+      unit: `${companyName} (${symbol}) — Figures in ₹ Cr`, rows: td.rows, tableData: td });
+  }
+
+  return stmts;
+}
 
 function App() {
   const [files, setFiles] = React.useState([]);
@@ -250,6 +352,48 @@ function App() {
     }));
   }
 
+  // ── Yahoo Finance fetch ─────────────────────────────────────────────────────
+  const [yahooQuery, setYahooQuery] = React.useState("");
+  const [yahooResults, setYahooResults] = React.useState([]);
+  const [yahooSearching, setYahooSearching] = React.useState(false);
+  const [yahooFetching, setYahooFetching] = React.useState(false);
+  const yahooDebounce = React.useRef(null);
+
+  function handleYahooSearch(q) {
+    setYahooQuery(q);
+    setYahooResults([]);
+    clearTimeout(yahooDebounce.current);
+    if (q.trim().length < 2) return;
+    yahooDebounce.current = setTimeout(async () => {
+      setYahooSearching(true);
+      try {
+        const data = await fetchJson(`/api/yahoo?action=search&q=${encodeURIComponent(q)}`);
+        setYahooResults(data.quotes || []);
+      } catch { setYahooResults([]); }
+      setYahooSearching(false);
+    }, 400);
+  }
+
+  async function fetchYahooFinancials(symbol, name) {
+    setYahooResults([]);
+    setYahooQuery(name);
+    setYahooFetching(true);
+    setError("");
+    try {
+      const data = await fetchJson(`/api/yahoo?action=financials&symbol=${encodeURIComponent(symbol)}`);
+      const stmts = parseYahooStatements(data, symbol, name);
+      if (!stmts.length) throw new Error("No financial data found for this company.");
+      setJob(current => ({
+        ...current,
+        statements: [...current.statements.filter(s => s.rows.length > 0), ...stmts]
+      }));
+      setActiveStatement(0);
+    } catch(e) {
+      setError(e.message);
+    }
+    setYahooFetching(false);
+  }
+
   function reset() {
     setFiles([]);
     setJob(emptyJob);
@@ -325,6 +469,46 @@ function App() {
               {busy ? <Loader2 className="animate-spin" size={18} /> : <Wand2 size={18} />}
               Convert
             </button>
+          </section>
+
+          {/* ── Yahoo Finance Fetch ── */}
+          <section className="rounded-lg border border-zinc-200 bg-white p-5 shadow-sm">
+            <div className="mb-3 flex items-center gap-2 font-bold text-sm">
+              <Globe size={16} className="text-emerald-700" />
+              Fetch from Yahoo Finance
+            </div>
+            <div className="relative">
+              <input
+                type="text"
+                value={yahooQuery}
+                onChange={e => handleYahooSearch(e.target.value)}
+                placeholder="Search company (e.g. Reliance Industries)"
+                className="w-full rounded-lg border border-zinc-200 bg-zinc-50 px-3 py-2 pr-8 text-sm outline-none focus:border-emerald-500 focus:ring-2 focus:ring-emerald-100"
+              />
+              <span className="absolute right-2.5 top-2.5 text-zinc-400">
+                {yahooSearching ? <Loader2 size={15} className="animate-spin" /> : <Search size={15} />}
+              </span>
+            </div>
+            {yahooResults.length > 0 && (
+              <ul className="mt-1 rounded-lg border border-zinc-200 bg-white shadow-lg">
+                {yahooResults.map(r => (
+                  <li key={r.symbol}>
+                    <button
+                      onClick={() => fetchYahooFinancials(r.symbol, r.name || r.symbol)}
+                      className="flex w-full flex-col px-3 py-2 text-left text-sm hover:bg-emerald-50"
+                    >
+                      <span className="font-semibold">{r.name || r.symbol}</span>
+                      <span className="text-xs text-zinc-400">{r.symbol} · {r.exchange}</span>
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            )}
+            {yahooFetching && (
+              <p className="mt-2 flex items-center gap-2 text-xs text-zinc-500">
+                <Loader2 size={13} className="animate-spin" /> Fetching financials…
+              </p>
+            )}
           </section>
 
           <StatusPanel job={job} confidence={overallConfidence} />
